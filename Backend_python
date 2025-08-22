@@ -1,0 +1,184 @@
+
+import cv2
+import numpy as np
+import pytesseract
+from pytesseract import Output
+import easyocr
+from openai import OpenAI
+from pdf2image import convert_from_path
+import os
+
+# ---------- Init ----------
+EASYOCR_READER = easyocr.Reader(['kn', 'en'])  
+client = OpenAI()  # requires OPENAI_API_KEY in env
+
+
+# ---------- PDF to Images ----------
+def pdf_to_images(pdf_path: str, dpi: int = 300):
+    pages = convert_from_path(pdf_path, dpi)
+    img_paths = []
+    for i, page in enumerate(pages):
+        out_path = f"temp_page_{i}.png"
+        page.save(out_path, "PNG")
+        img_paths.append(out_path)
+    return img_paths
+
+
+# ---------- Preprocessing ----------
+def preprocess_for_ocr(image_path: str):
+    img = cv2.imread(image_path, cv2.IMREAD_GRAYSCALE)
+    if img is None:
+        raise FileNotFoundError(f"❌ Could not read image: {image_path}")
+    img = cv2.fastNlMeansDenoising(img, None, 7, 7, 21)  # denoise
+    _, bin_img = cv2.threshold(img, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    return bin_img
+
+
+# ---------- Tesseract ----------
+def tesseract_ocr(image_bin, lang="kan+eng"):
+    config = r'--oem 3 --psm 6'
+    data = pytesseract.image_to_data(image_bin, lang=lang, output_type=Output.DICT, config=config)
+    words, confs = data.get('text', []), data.get('conf', [])
+    clean_words, conf_vals = [], []
+    for w, c in zip(words, confs):
+        if w and w.strip() and c != '-1':
+            clean_words.append(w)
+            try:
+                conf_vals.append(float(c))
+            except:
+                pass
+    text = " ".join(clean_words)
+    avg_conf = float(np.mean(conf_vals)) if conf_vals else 0.0
+    return text, avg_conf
+
+
+# ---------- EasyOCR ----------
+def easyocr_ocr(image_path: str):
+    results = EASYOCR_READER.readtext(image_path, detail=True)
+    texts, probs = [], []
+    for item in results:
+        if len(item) == 3:
+            _, t, p = item
+            if isinstance(t, str) and t.strip():
+                texts.append(t.strip())
+                probs.append(float(p))
+    text = " ".join(texts)
+    avg_prob = float(np.mean(probs)) if probs else 0.0
+    return text, avg_prob
+
+
+# ---------- Language Detection ----------
+def looks_kannada(s: str) -> bool:
+    kannada_chars = sum(1 for ch in s if 0x0C80 <= ord(ch) <= 0x0CFF)
+    return kannada_chars >= max(3, int(0.2 * max(1, len(s))))
+
+
+# ---------- Smart OCR (Tesseract + EasyOCR) ----------
+def smart_ocr(image_path: str, text_type: str = "auto"):
+    bin_img = preprocess_for_ocr(image_path)
+
+    # Detect language first
+    probe_text, _ = tesseract_ocr(bin_img, lang="kan+eng")
+    language = "kan" if looks_kannada(probe_text) else "eng"
+
+    # Printed text (Tesseract works better)
+    if text_type == "printed":
+        text_tes, conf_tes = tesseract_ocr(bin_img, lang="kan+eng")
+        final_text, final_score = text_tes, conf_tes / 100.0
+
+    # Handwritten text (EasyOCR works better)
+    elif text_type == "handwritten":
+        text_ez, prob_ez = easyocr_ocr(image_path)
+        final_text, final_score = text_ez, prob_ez
+
+    # Auto mode → pick best between both
+    else:
+        text_tes, conf_tes = tesseract_ocr(bin_img, lang="kan+eng")
+        score_tes = conf_tes / 100.0
+        text_ez, prob_ez = easyocr_ocr(image_path)
+
+        if prob_ez > max(score_tes, 0.5) or (prob_ez >= score_tes and len(text_ez) > len(text_tes)):
+            final_text, final_score = text_ez, prob_ez
+        else:
+            final_text, final_score = text_tes, score_tes
+
+    return {"language": language, "text": final_text.strip(), "score": round(float(final_score), 3)}
+
+
+# ---------- GPT Postprocessing ----------
+def gpt_clean_text(raw_text: str, lang: str = "kan") -> str:
+    if not raw_text.strip():
+        return ""
+    prompt = f"Clean and correct the following OCR output in { 'Kannada' if lang == 'kan' else 'English' }.\n\nText:\n{raw_text}\n\nCorrected Text:"
+    resp = client.chat.completions.create(
+        model="gpt-5-mini",  # Use fast + available model
+        messages=[{"role": "system", "content": "You are an OCR text corrector."},
+                  {"role": "user", "content": prompt}],
+        temperature=0.2
+    )
+    return resp.choices[0].message.content.strip()
+
+
+# ---------- Document Classification ----------
+def classify_document(text: str) -> str:
+    """Classify legal document type (EC, RTC, Sale Deed, Unknown)."""
+    if not text.strip():
+        return "Unknown"
+    resp = client.chat.completions.create(
+        model="gpt-5-mini",
+        messages=[{"role": "system", "content": "You are a legal document classifier."},
+                  {"role": "user", "content": f"Classify this legal document into one of: EC, RTC, Sale Deed, Unknown.\n\n{text}"}],
+        temperature=0
+    )
+    return resp.choices[0].message.content.strip()
+
+
+# ---------- Entity Extraction ----------
+def extract_entities(text: str) -> dict:
+    """Extract key details like Name, Age, From/To, Property ID"""
+    if not text.strip():
+        return {}
+    resp = client.chat.completions.create(
+        model="gpt-5-mini",
+        messages=[{"role": "system", "content": "You are an information extractor for Kannada legal property documents."},
+                  {"role": "user", "content": f"Extract the following as JSON:\n- Names (seller, buyer)\n- Age\n- Property ID or Survey No\n- From whom to whom transfer\n\nText:\n{text}"}],
+        temperature=0
+    )
+    try:
+        return eval(resp.choices[0].message.content.strip())
+    except:
+        return {"raw": resp.choices[0].message.content.strip()}
+
+
+# ---------- Example ----------
+if __name__ == "__main__":
+    file_path = "project.pdf"   # <<< Replace with your file
+
+    # If PDF → convert to images
+    if file_path.lower().endswith(".pdf"):
+        pages = pdf_to_images(file_path)
+    else:
+        pages = [file_path]
+
+    full_text = []
+    for p in pages:
+        raw_result = smart_ocr(p, text_type="auto")
+        print(f"📄 Page: {p} | Language: {raw_result['language']} | Confidence: {raw_result['score']}")
+        print("\n--- Raw OCR Text ---\n", raw_result["text"])
+
+        cleaned = gpt_clean_text(raw_result["text"], lang=raw_result["language"])
+        print("\n--- GPT Corrected Text ---\n", cleaned)
+
+        full_text.append(cleaned)
+        os.remove(p) if p.startswith("temp_page_") else None  # cleanup temp files
+
+    # Join all pages
+    document_text = "\n".join(full_text)
+
+    # Classify document
+    doc_type = classify_document(document_text)
+    print("\n📑 Document Type:", doc_type)
+
+    # Extract entities
+    entities = extract_entities(document_text)
+    print("\n👤 Extracted Entities:", entities)
